@@ -58,6 +58,7 @@ func main() {
 	router := gin.Default()
 	router.POST("/generate-tokens", auth.GenerateTokensHandler)
 	router.POST("/refresh-tokens", auth.RefreshTokensHandler)
+	router.POST("/replace-token-cookie", auth.ReplaceTokenCookieHandler)
 	router.POST("/test-access-token", auth.TestAccessTokenHandler)
 	router.Run("localhost:8080")
 }

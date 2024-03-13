@@ -1,9 +1,9 @@
 package auth
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/base64"
-	_ "encoding/json"
 	"errors"
 	"log/slog"
 	"time"
@@ -39,7 +39,7 @@ func generateRandomBytes(n int) ([]byte, error) {
 	return b, nil
 }
 
-// generateAccessToken генерирует JWT токен
+// generateAccessToken генерирует JWT Access токен
 func generateAccessToken(key []byte, guid string, tokenAge int64) (string, error) {
 
 	if guid == "" {
@@ -78,18 +78,30 @@ func generateRefreshToken(tokenAge int64) (RefreshToken, error) {
 	return refreshToken, err
 }
 
-// generateTokens генерирует Access и Refresh токен
+// generateTokens генерирует пару: Access токен, Refresh токен
 func generateTokens(GUID string) (string, RefreshToken, error) {
 	var (
-		accessTokenStr string
-		refreshToken   RefreshToken
-		rth            []byte
-		err            error
+		accessTokenStr       string
+		accessTokenSignature []byte
+		refreshToken         RefreshToken
+		atsh                 []byte
+		rth                  []byte
+		err                  error
 	)
 
 	// Генерация Access токена
 	if accessTokenStr, err = generateAccessToken([]byte(env.ACCESS_TOKEN_SECRET), GUID, accessTokenAge); err != nil {
 		return "", RefreshToken{}, errors.New("error generating accessToken: " + err.Error())
+	}
+
+	// Извлечение сигнатуры Access токена, раскодирование из base64rawURL
+	if accessTokenSignature, err = extractJWTSignatureDecodeB64rawURL(accessTokenStr); err != nil {
+		return "", RefreshToken{}, errors.New("error extracting accessToken signature: " + err.Error())
+	}
+
+	// Хеширование base64rawURL-раскодированной сигнатуры Access токена
+	if atsh, err = bcrypt.GenerateFromPassword(accessTokenSignature, bcrypt.DefaultCost); err != nil {
+		return "", RefreshToken{}, errors.New("error hashing accessToken signature: " + err.Error())
 	}
 
 	// Генерация Refresh токена
@@ -102,23 +114,48 @@ func generateTokens(GUID string) (string, RefreshToken, error) {
 		return "", RefreshToken{}, errors.New("error hashing refreshToken: " + err.Error())
 	}
 
-	// Запись хеша и expiration date Refresh токена в Mongo
-	if err = database.DBupsertRTHdoc(GUID, string(rth), refreshToken.Exp); err != nil {
+	// Запись хеша и expiration date Refresh токена,
+	// а также хеша base64rawURL-раскодированной сигнатуры Access токена в Mongo
+	if err = database.DBupsertRTHdoc(GUID, string(rth), refreshToken.Exp, string(atsh)); err != nil {
 		return "", RefreshToken{}, errors.New("error upserting hashed refreshToken: " + err.Error())
 	}
 
 	return accessTokenStr, refreshToken, err
 }
 
+// extractJWTSignatureDecodeB64rawURL извлекает сигнатуру Access токена, раскодирует из base64rawURL
+func extractJWTSignatureDecodeB64rawURL(accessTokenStr string) ([]byte, error) {
+	var (
+		bytesWritten int
+		err          error
+	)
+
+	accessTokenSignature := make([]byte, 64)
+
+	accessTokenSignatureB64 := bytes.Split([]byte(accessTokenStr), []byte("."))[2]
+	bytesWritten, err = base64.RawURLEncoding.Decode(accessTokenSignature, accessTokenSignatureB64)
+
+	if bytesWritten == 0 {
+		return nil, errors.New("error base64url-decoding signature, empty sequence")
+	}
+
+	if err != nil {
+		return nil, err
+	}
+
+	return accessTokenSignature, err
+}
+
 // setCookies создаёт cookies. Refresh токен предварительно кодируется в base64
 func setCookies(c *gin.Context, accessTokenStr string, refreshToken RefreshToken) {
 	c.SetCookie("ttb_access_token", accessTokenStr, int(accessTokenAge), "/", "localhost", false, true)
-	// Кодирование токена в base64 перед записью в cookie
+	// Кодирование Refresh токена в base64 перед записью в cookie
 	refreshTokenB64str := base64.StdEncoding.EncodeToString(refreshToken.Token)
 	c.SetCookie("ttb_refresh_token", refreshTokenB64str, int(refreshTokenAge), "/refresh-tokens", "localhost", false, true)
 }
 
-// getCookies Извлечение Refresh токена в виде base64-строки из cookies. Раскодирование из base64 в исходные байты
+// getCookies Извлечение Refresh токена в виде base64 строки из cookies.
+// Раскодирование из base64 в исходные байты
 func getRefreshTokenBytesFromCookie(c *gin.Context) ([]byte, error) {
 
 	var (
@@ -139,25 +176,39 @@ func getRefreshTokenBytesFromCookie(c *gin.Context) ([]byte, error) {
 
 }
 
-// validateRefreshToken ищет в Mongo по GUID документ где лежит bcrypt хеш Refresh токена.
-// Проверяет токен на соответствие с помощью хеша. Проверят не истек ли срок годности токена.
-func validateRefreshToken(GUID string, refreshTokenBytes []byte) error {
+// validateTokensViaDB ищет в Mongo по GUID документ, где лежит bcrypt хеш Refresh токена, его "exp",
+// и хеш сигнатуры Access токена.
+// Проверяет Refresh токен на соответствие с помощью его хеша.
+// Проверяет не истек ли срок годности Refresh токена.
+// Проверяет base64rawURL-раскодированную сигнатуру Access токена на соответствие с помощью её хеша.
+func validateTokensViaDB(GUID string, refreshTokenBytes []byte, accessTokenStr string) error {
 	var (
-		rthDoc models.RTHdoc
-		err    error
+		rthDoc               models.RTHdoc
+		accessTokenSignature []byte
+		err                  error
 	)
 	// Поиск документа в Mongo и демаршализация в структуру models.RTHdoc
 	if rthDoc, err = database.DBfindRTHdoc(GUID); err != nil {
 		return errors.New("error finding RTH document: " + err.Error())
 	}
 
-	// Проверка соответствия токена хешу
+	// Извлечение сигнатуры Access токена, раскодирование из base64rawURL
+	if accessTokenSignature, err = extractJWTSignatureDecodeB64rawURL(accessTokenStr); err != nil {
+		return errors.New("error extracting Access token signature: " + err.Error())
+	}
+
+	// Проверка соответствия сигнатуры Access токена его хешу
+	if err = bcrypt.CompareHashAndPassword([]byte(rthDoc.ATSH), accessTokenSignature); err != nil {
+		return errors.New("error comparing Access token to hash: " + err.Error())
+	}
+
+	// Проверка соответствия Refresh токена его хешу
 	if err = bcrypt.CompareHashAndPassword([]byte(rthDoc.RTH), refreshTokenBytes); err != nil {
 		return errors.New("error comparing Refresh token to hash: " + err.Error())
 	}
 
-	// Проверка токена на истечение срока годности
-	if time.Now().Compare(time.Unix(rthDoc.Exp, 0)) > 0 {
+	// Проверка Refresh токена на истечение срока годности
+	if time.Now().Compare(time.Unix(rthDoc.RTexp, 0)) > 0 {
 		return errors.New("error checking Refresh token expiration time: token expired")
 	}
 
@@ -219,9 +270,10 @@ func GenerateTokensHandler(c *gin.Context) {
 
 // RefreshTokensHandler обрабатывает POST запрос на создание новой пары Access-Refresh токенов.
 // GUID пользователя в JSON.
-// Текущий Refresh токен хранится в cookie.
+// Текущие Refresh и Access токены хранятся в cookies.
 func RefreshTokensHandler(c *gin.Context) {
 	var (
+		accessTokenStr    string
 		refreshTokenBytes []byte
 		newAccessTokenStr string
 		newRefreshToken   RefreshToken
@@ -238,6 +290,22 @@ func RefreshTokensHandler(c *gin.Context) {
 		return
 	}
 
+	// Извлечение Access токена в виде строки из cookies.
+	if accessTokenStr, err = c.Cookie("ttb_access_token"); err != nil {
+		errStr := "error getting Access Token from cookie: " + err.Error() + " (ttb_access_token)"
+		c.JSON(401, errStr)
+		slog.Error(errStr)
+		return
+	}
+
+	// Валидация Access токена (подпись, срок годности)
+	if _, err = parseValidateAccessToken(accessTokenStr, env.ACCESS_TOKEN_SECRET); err != nil {
+		errStr := "error parsing and validating Access token: " + err.Error()
+		c.JSON(401, errStr)
+		slog.Error(errStr)
+		return
+	}
+
 	// Извлечение Refresh токена в виде base64-строки из cookies. Раскодирование из base64 в исходные байты
 	if refreshTokenBytes, err = getRefreshTokenBytesFromCookie(c); err != nil {
 		errStr := "error getting Refresh Token from cookie: " + err.Error()
@@ -246,10 +314,13 @@ func RefreshTokensHandler(c *gin.Context) {
 		return
 	}
 
-	// Поиск в Mongo по GUID документ где лежит bcrypt хеш Refresh токена.
-	// Проверка токен на соответствие с помощью хеша. Проверка не истек ли срок годности токена.
-	if err = validateRefreshToken(user.GUID, refreshTokenBytes); err != nil {
-		errStr := "error validating Refresh Token: " + err.Error()
+	// Поиск в Mongo по GUID документа, где лежит bcrypt хеш Refresh токена, его "exp",
+	// и хеш сигнатуры Access токена.
+	// Проверка Refresh токен на соответствие с помощью его хеша.
+	// Проверка не истек ли срок годности токена.
+	// Проверка base64rawURL-раскодированной сигнатуры Access токена на соответствие с помощью её хеша.
+	if err = validateTokensViaDB(user.GUID, refreshTokenBytes, accessTokenStr); err != nil {
+		errStr := "error validating tokens via DB: " + err.Error()
 		c.JSON(401, errStr)
 		slog.Error(errStr)
 		return
@@ -270,6 +341,47 @@ func RefreshTokensHandler(c *gin.Context) {
 	slog.Info(successStr)
 }
 
+// ReplaceTokenCookieHandler обрабатывает POST запрос,
+// выполняя в cookie подмену текущего Access или Refresh токена на переданный в JSON запроса.
+// Поле JSON запроса для токена, который требуется оставить прежним, заполнено пустой строкой.
+// Используется для тестирования связности Access и Refresh токенов во время Refresh операции.
+func ReplaceTokenCookieHandler(c *gin.Context) {
+
+	tokenName := ""
+	tokensReplacement := models.TokensReplacement{}
+
+	// Сериализация JSON запроса через BindJSON в структуру типа User
+	if err := c.BindJSON(&tokensReplacement); err != nil {
+		errStr := "error getting fields from req JSON: "
+		slog.Error(errStr + err.Error())
+		c.JSON(401, errStr)
+		return
+	}
+
+	// Подмена cookie Access токена
+	if len(tokensReplacement.AccessToken) != 0 {
+		c.SetCookie("ttb_access_token", tokensReplacement.AccessToken, int(accessTokenAge), "/", "localhost", false, true)
+		tokenName = "Access"
+	}
+
+	// Подмена cookie Refresh токена
+	if len(tokensReplacement.RefreshToken) != 0 {
+		c.SetCookie("ttb_refresh_token", tokensReplacement.RefreshToken, int(accessTokenAge), "/refresh-tokens", "localhost", false, true)
+		tokenName = "Refresh"
+	}
+
+	if len(tokenName) == 0 {
+		successStr := "no token cookie was requested to be replaced"
+		c.JSON(304, successStr)
+		slog.Info(successStr)
+		return
+	}
+
+	successStr := tokenName + " token cookie replaced successfully"
+	c.JSON(200, successStr)
+	slog.Info(successStr)
+}
+
 // TestAccessTokenHandler обрабатывает тестовые POST запросы с Access токеном
 func TestAccessTokenHandler(c *gin.Context) {
 
@@ -279,6 +391,7 @@ func TestAccessTokenHandler(c *gin.Context) {
 		err            error
 	)
 
+	// Извлечение Access токена в виде строки из cookies.
 	if accessTokenStr, err = c.Cookie("ttb_access_token"); err != nil {
 		errStr := err.Error() + " (ttb_access_token)"
 		c.JSON(401, errStr)
@@ -286,6 +399,7 @@ func TestAccessTokenHandler(c *gin.Context) {
 		return
 	}
 
+	// Валидация Access токена (подпись, срок годности)
 	if accesshToken, err = parseValidateAccessToken(accessTokenStr, env.ACCESS_TOKEN_SECRET); err != nil {
 		errStr := "error parsing and validating Access token: " + err.Error()
 		c.JSON(401, errStr)

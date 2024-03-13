@@ -16,16 +16,17 @@ var Client *mongo.Client
 const rthCollectionName = "refreshTokensHashed"
 
 // DBupsertRTHdoc добавляет/обновляет документ, хранящий GUID пользователя,
-// хеш Refresh токена (конвертирован в string) и "exp" (expirtaion time) в Mongo.
+// хеш Refresh токена (конвертирован в string) и его "exp" (expirtaion time),
+// а также хеш base64rawURL-раскодированной сигнатуры Access токена (также конвертирован в string) в Mongo.
 // "RTH" расшифровывается как "Refresh Token Hash"
-func DBupsertRTHdoc(GUID, RTH string, exp int64) error {
+func DBupsertRTHdoc(GUID, RTH string, RTexp int64, ATSH string) error {
 
 	guidRTHCollection := Client.Database(env.DB_NAME).Collection(rthCollectionName)
 	filter := bson.D{{"GUID", GUID}}
 	update := bson.D{
 		{
 			"$set",
-			bson.D{{"RTH", RTH}, {"Exp", exp}},
+			bson.D{{"RTH", RTH}, {"RTexp", RTexp}, {"ATSH", ATSH}},
 		},
 	}
 	opts := options.Update().SetUpsert(true)
@@ -37,7 +38,8 @@ func DBupsertRTHdoc(GUID, RTH string, exp int64) error {
 	return nil
 }
 
-// DBfindRTHdoc ищет в Mongo по GUID документ где лежит bcrypt хеш Refresh токена.
+// DBfindRTHdoc ищет в Mongo по GUID документ где лежит bcrypt хеш Refresh токена, его "exp",
+// и хеш сигнатуры Access токена.
 // Демаршализирует документ в структуру models.RTHdoc
 func DBfindRTHdoc(GUID string) (models.RTHdoc, error) {
 
